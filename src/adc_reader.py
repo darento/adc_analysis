@@ -1,76 +1,11 @@
 import struct
 import time
+import numpy as np
 from tqdm import tqdm
 import os
 import matplotlib.pyplot as plt
 from multiprocessing import Process, Queue
 from typing import Generator, Iterator, Tuple, List
-
-
-def _parse_header(chunk: bytes) -> dict:
-    """
-    Parses the header of a data chunk.
-
-    Args:
-        chunk (bytes): A 56-byte data chunk.
-
-    Returns:
-        dict: A dictionary containing:
-            - `CTRL` (int): Control signals.
-            - `D3-D0` (int): Digital signals.
-            - `Timestamp` (int): Timestamp.
-            - `S` (int): Status bit.
-            - `ModuleID` (int): Module ID.
-    """
-    ctrl_digital = chunk[0]
-    ctrl = (ctrl_digital & 0xF0) >> 4
-    digital_signals = ctrl_digital & 0x0F
-
-    timestamp = struct.unpack(">I", chunk[1:5])[0]
-
-    s_module = chunk[5]
-    s = (s_module & 0x80) >> 7
-    module_id = s_module & 0x7F
-
-    return {
-        "CTRL": ctrl,
-        "D3-D0": digital_signals,
-        "Timestamp": timestamp,
-        "S": s,
-        "ModuleID": module_id,
-    }
-
-
-def _parse_adc_channels(adc_data: bytes, order: list) -> List[int]:
-    """
-    Parses the ADC channel values from a data chunk.
-
-    Args:
-        adc_data (bytes): The ADC data part of the chunk (50 bytes).
-
-    Returns:
-        List[int]: A list of 33 ADC channel values (int, 12-bit resolution).
-    """
-    adc_channels = [0] * 33
-    bytes_data = struct.unpack(f"{len(adc_data)}B", adc_data)
-    for i in range(0, len(adc_data) - 2, 3):
-        byte1, byte2, byte3 = bytes_data[i : i + 3]
-
-        adc1 = ((byte1 << 4) | (byte2 >> 4)) & 0xFFF
-        adc2 = ((byte2 & 0x0F) << 8) | byte3
-
-        adc_channels[i // 3 * 2] = adc1
-        adc_channels[i // 3 * 2 + 1] = adc2
-
-    # Process the last ADC (ADC33)
-    byte1, byte2 = bytes_data[-2:]
-    adc33 = ((byte1 << 4) | (byte2 >> 4)) & 0xFFF
-    adc_channels[-1] = adc33
-
-    # Send only the channels in the order specified
-    adc_channels = [adc_channels[i] for i in order]
-
-    return adc_channels
 
 
 def _extract_data(
@@ -89,22 +24,52 @@ def _extract_data(
             - List of tuples with event index and timestamp.
             - List of ADC channel values.
     """
-    timestamps = []
-    adc_data_list = []
-    valid_event_index = 0
-    for i in range(0, len(buffer), event_size):
-        if i + event_size > len(buffer):
-            break
-        chunk = buffer[i : i + event_size]
-        header = _parse_header(chunk)
-        if header["S"] == 1:
-            continue
-        adc_data = _parse_adc_channels(chunk[6:], order)
-        timestamps.append((valid_event_index, header["Timestamp"]))
-        adc_data_list.append(adc_data)
-        valid_event_index += 1
+    # Load the buffer as a structured array
+    events = np.frombuffer(buffer, dtype=event_dtype(event_size))
 
-    return timestamps, adc_data_list
+    # Extract headers
+    num_events = len(events)
+    headers = np.zeros(
+        num_events,
+        dtype=[
+            ("CTRL", "u1"),
+            ("D3-D0", "u1"),
+            ("Timestamp", ">u4"),
+            ("S", "u1"),
+            ("ModuleID", "u1"),
+        ],
+    )
+    headers["CTRL"] = (events["CTRL"] & 0xF0) >> 4
+    headers["D3-D0"] = events["CTRL"] & 0x0F
+    headers["Timestamp"] = events["Timestamp"]
+    headers["S"] = (events["S_ModuleID"] & 0x80) >> 7
+    headers["ModuleID"] = events["S_ModuleID"] & 0x7F
+
+    # Extract ADC channels
+    adc_data = events["ADC_Data"].astype(np.uint16)  # Ensure data is uint16
+    adc_channels = np.zeros((num_events, 33), dtype=np.uint16)  # Correct dtype
+
+    # Decode 12-bit ADC values
+    adc_channels[:, :-1:2] = (
+        (adc_data[:, :-2:3].astype(np.uint16) << 4)
+        | (adc_data[:, 1:-1:3].astype(np.uint16) >> 4)
+    ) & 0xFFF
+    adc_channels[:, 1::2] = (
+        (adc_data[:, 1:-1:3].astype(np.uint16) & 0x0F) << 8
+    ) | adc_data[:, 2::3].astype(np.uint16)
+    adc_channels[:, -1] = (
+        (adc_data[:, -2].astype(np.uint16) << 4)
+        | (adc_data[:, -1].astype(np.uint16) >> 4)
+    ) & 0xFFF
+
+    # Retrieve only headers and adc_channels for the events with S=0
+    timestamps = headers["Timestamp"][headers["S"] == 0]
+    adc_channels = adc_channels[headers["S"] == 0]
+
+    # Retrieve only the columns of the adc_channels specified in the order list
+    adc_channels = adc_channels[:, order]
+
+    return timestamps, adc_channels
 
 
 def _detect_coincidences(
@@ -169,19 +134,29 @@ def writer_process(output_file: str, queue: Queue):
         output_file (str): Path to the output file.
         queue (Queue): Queue to receive coincidences from worker processes.
     """
+    batch = []
     with open(output_file, "w") as file:
         while True:
             data = queue.get()
             if data == "DONE":
                 break
-            groups, adc_values = data
-            # write per columns in the file, where each line is a coincidence
-            for group, adc_value in zip(groups, adc_values):
+            batch.append(data)
+            # Write the batch when it reaches a certain size
+            if len(batch) >= 1000:
+                for group, adc_values in batch:
+                    for g, adc in zip(group, adc_values):
+                        file.write(
+                            "\t".join(map(str, g))
+                            + "\t"
+                            + "\t".join(map(str, adc))
+                            + "\n"
+                        )
+                batch = []  # Clear the batch
+        # Write remaining data
+        for group, adc_values in batch:
+            for g, adc in zip(group, adc_values):
                 file.write(
-                    "\t".join(map(str, group))
-                    + "\t"
-                    + "\t".join(map(str, adc_value))
-                    + "\n"
+                    "\t".join(map(str, g)) + "\t" + "\t".join(map(str, adc)) + "\n"
                 )
 
 
@@ -224,6 +199,26 @@ def worker_process(
         cnt_chunks += 1
 
 
+def event_dtype(event_size: int = 56) -> np.dtype:
+    """
+    Defines the structured dtype for an event.
+
+    Args:
+        event_size (int): Total size of an event in bytes.
+
+    Returns:
+        np.dtype: Structured dtype representing the event.
+    """
+    return np.dtype(
+        [
+            ("CTRL", "u1"),  # 1 byte (CTRL and D3-D0 combined)
+            ("Timestamp", ">u4"),  # 4 bytes (big-endian)
+            ("S_ModuleID", "u1"),  # 1 byte (S and ModuleID combined)
+            ("ADC_Data", f"{event_size - 6}B"),  # Remaining bytes for ADC channels
+        ]
+    )
+
+
 def read_file_chunks(
     file_path: str, start: int, end: int, num_ev_buf: int, event_size: int, order: list
 ) -> Generator[Tuple[List[Tuple[int, int]], List[List[int]]], None, None]:
@@ -233,11 +228,11 @@ def read_file_chunks(
 
     Args:
         file_path (str): Path to the file.
-        start (int): Start byte position for this segment.
-        end (int): End byte position for this segment.
-        threshold (int): Threshold for coincidence detection.
-        queue (Queue): Queue to send coincidences to the writer process.
+        start (int): Start byte position.
+        end (int): End byte position.
+        num_ev_buf (int): Size of the buffer to read.
         event_size (int): Size of each event in bytes.
+        order (list): The order of the ADC channels.
     """
     buffer_size = num_ev_buf * event_size  # Define a buffer size for smaller chunks
     with open(file_path, "rb") as file:
@@ -257,11 +252,9 @@ def read_file_chunks(
                 current_position += read_size
                 pbar.update(read_size)
 
-                # Extract timestamps and ADC data
-                timestamps, adc_data_list = _extract_data(buffer, event_size, order)
-                yield timestamps, adc_data_list
+                headers, adc_channels = _extract_data(buffer, event_size, order)
 
-            pbar.close()
+                yield headers, adc_channels
 
 
 if __name__ == "__main__":
@@ -271,7 +264,7 @@ if __name__ == "__main__":
     output_file = (
         "P:/Valencia/I3M/Proyectos/DeepBrain/data/05022024_FOV0_0_600s_coincidences.txt"
     )
-    num_ev_buf = 1000
+    num_ev_buf = 10000
     event_size = 56
     # order = [1, 2, 3, 4, 5, 6, 7, 8, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
     # order = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
@@ -280,18 +273,29 @@ if __name__ == "__main__":
     threshold = 10000
     file_size = os.path.getsize(file_path)
     chunk_size = file_size // num_processes
-
+    timestamp_list = []
+    chunk_cnt = 0
     for timestamps, adc_data_list in read_file_chunks(
         file_path, 0, file_size, num_ev_buf, event_size, order
     ):
-        for t, adc in zip(timestamps, adc_data_list):
-            print(t, adc)
-            input("Press Enter to continue...")
+        # print(f"First 10 timestamps: {timestamps[0]}")
+        # print(f"First 10 ADC data: {adc_data_list[0]}")
+        # input("Press Enter to continue...")
+        # for t, adc in zip(timestamps, adc_data_list):
+        #     print(t, adc)
+        #     input("Press Enter to continue...")
+        if chunk_cnt <= 1:
+            timestamp_list.extend(timestamps)
+        chunk_cnt += 1
+        pass
+
+    plt.plot(timestamp_list, "o-")
+    plt.show()
 
     """
 
     # Create a Queue for communication
-    queue = Queue()
+    queue = Queue(maxsize=100000)
 
     # Start writer process
     writer = Process(target=writer_process, args=(output_file, queue))
