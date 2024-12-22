@@ -8,6 +8,17 @@ from multiprocessing import Process, Queue
 from typing import Generator, Iterator, Tuple, List
 
 
+# Define the structured dtype for an event as a constant
+EVENT_DTYPE = np.dtype(
+    [
+        ("CTRL", "u1"),  # 1 byte (CTRL and D3-D0 combined)
+        ("Timestamp", ">u4"),  # 4 bytes (Tstp big-endian)
+        ("S_ModuleID", "u1"),  # 1 byte (S and ModuleID combined)
+        ("ADC_Data", "50B"),  # 50 bytes (ADC data + 4 bit unused)
+    ]
+)
+
+
 def _extract_data(
     buffer: bytes, event_size: int, order: list
 ) -> Tuple[List[Tuple[int, int]], List[List[int]]]:
@@ -25,7 +36,7 @@ def _extract_data(
             - List of ADC channel values.
     """
     # Load the buffer as a structured array
-    events = np.frombuffer(buffer, dtype=event_dtype(event_size))
+    events = np.frombuffer(buffer, dtype=EVENT_DTYPE)
 
     # Extract headers
     num_events = len(events)
@@ -197,26 +208,6 @@ def worker_process(
 
         timestamp_list.extend(timestamps)
         cnt_chunks += 1
-
-
-def event_dtype(event_size: int = 56) -> np.dtype:
-    """
-    Defines the structured dtype for an event.
-
-    Args:
-        event_size (int): Total size of an event in bytes.
-
-    Returns:
-        np.dtype: Structured dtype representing the event.
-    """
-    return np.dtype(
-        [
-            ("CTRL", "u1"),  # 1 byte (CTRL and D3-D0 combined)
-            ("Timestamp", ">u4"),  # 4 bytes (big-endian)
-            ("S_ModuleID", "u1"),  # 1 byte (S and ModuleID combined)
-            ("ADC_Data", f"{event_size - 6}B"),  # Remaining bytes for ADC channels
-        ]
-    )
 
 
 def read_file_chunks(
