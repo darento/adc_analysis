@@ -7,80 +7,104 @@ import matplotlib.pyplot as plt
 from multiprocessing import Process, Queue
 from typing import Generator, Iterator, Tuple, List
 
-
-# Define the structured dtype for an event as a constant
-EVENT_DTYPE = np.dtype(
-    [
-        ("CTRL", "u1"),  # 1 byte (CTRL and D3-D0 combined)
-        ("Timestamp", ">u4"),  # 4 bytes (Tstp big-endian)
-        ("S_ModuleID", "u1"),  # 1 byte (S and ModuleID combined)
-        ("ADC_Data", "50B"),  # 50 bytes (ADC data + 4 bit unused)
-    ]
-)
+import numpy as np
+from typing import List, Tuple
+from event_formats import EVENT_DTYPE_V1, EVENT_DTYPE_V2
 
 
-def _extract_data(
-    buffer: bytes, event_size: int, order: list
-) -> Tuple[List[Tuple[int, int]], List[List[int]]]:
-    """
-    Extracts timestamps and ADC data from the buffer.
+class EventParser:
+    def __init__(self, version: str = "v2"):
+        self.version = version.lower()
+        if self.version == "v1":
+            self.event_dtype = EVENT_DTYPE_V1
+        elif self.version == "v2":
+            self.event_dtype = EVENT_DTYPE_V2
+        else:
+            raise ValueError(f"Unsupported version: {version}")
 
-    Args:
-        buffer (bytes): The buffer containing the data.
-        event_size (int): Size of each event in bytes.
-        order (list): The order of the ADC channels.
+    def parse(self, buffer: bytes, order: List[int]) -> Tuple[np.ndarray, np.ndarray]:
+        if self.version == "v1":
+            return self._parse_v1(buffer, order)
+        elif self.version == "v2":
+            return self._parse_v2(buffer, order)
 
-    Returns:
-        Tuple[List[Tuple[int, int]], List[List[int]]]: A tuple containing:
-            - List of tuples with event index and timestamp.
-            - List of ADC channel values.
-    """
-    # Load the buffer as a structured array
-    events = np.frombuffer(buffer, dtype=EVENT_DTYPE)
+    def _parse_v1(
+        self, buffer: bytes, order: List[int]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        events = np.frombuffer(buffer, dtype=self.event_dtype)
+        num_events = len(events)
 
-    # Extract headers
-    num_events = len(events)
-    headers = np.zeros(
-        num_events,
-        dtype=[
-            ("CTRL", "u1"),
-            ("D3-D0", "u1"),
-            ("Timestamp", ">u4"),
-            ("S", "u1"),
-            ("ModuleID", "u1"),
-        ],
-    )
-    headers["CTRL"] = (events["CTRL"] & 0xF0) >> 4
-    headers["D3-D0"] = events["CTRL"] & 0x0F
-    headers["Timestamp"] = events["Timestamp"]
-    headers["S"] = (events["S_ModuleID"] & 0x80) >> 7
-    headers["ModuleID"] = events["S_ModuleID"] & 0x7F
+        headers = np.zeros(
+            num_events,
+            dtype=[
+                ("CTRL", "u1"),
+                ("D3-D0", "u1"),
+                ("Timestamp", ">u4"),
+                ("S", "u1"),
+                ("ModuleID", "u1"),
+            ],
+        )
 
-    # Extract ADC channels
-    adc_data = events["ADC_Data"].astype(np.uint16)  # Ensure data is uint16
-    adc_channels = np.zeros((num_events, 33), dtype=np.uint16)  # Correct dtype
+        headers["CTRL"] = (events["CTRL"] & 0xF0) >> 4
+        headers["D3-D0"] = events["CTRL"] & 0x0F
+        headers["Timestamp"] = events["Timestamp"]
+        headers["S"] = (events["S_ModuleID"] & 0x80) >> 7
+        headers["ModuleID"] = events["S_ModuleID"] & 0x7F
 
-    # Decode 12-bit ADC values
-    adc_channels[:, :-1:2] = (
-        (adc_data[:, :-2:3].astype(np.uint16) << 4)
-        | (adc_data[:, 1:-1:3].astype(np.uint16) >> 4)
-    ) & 0xFFF
-    adc_channels[:, 1::2] = (
-        (adc_data[:, 1:-1:3].astype(np.uint16) & 0x0F) << 8
-    ) | adc_data[:, 2::3].astype(np.uint16)
-    adc_channels[:, -1] = (
-        (adc_data[:, -2].astype(np.uint16) << 4)
-        | (adc_data[:, -1].astype(np.uint16) >> 4)
-    ) & 0xFFF
+        adc_data = events["ADC_Data"].astype(np.uint16)
+        adc_channels = np.zeros((num_events, 33), dtype=np.uint16)
 
-    # Retrieve only headers and adc_channels for the events with S=0
-    timestamps = headers["Timestamp"][headers["S"] == 0]
-    adc_channels = adc_channels[headers["S"] == 0]
+        adc_channels[:, :-1:2] = (
+            (adc_data[:, :-2:3] << 4) | (adc_data[:, 1:-1:3] >> 4)
+        ) & 0xFFF
 
-    # Retrieve only the columns of the adc_channels specified in the order list
-    adc_channels = adc_channels[:, order]
+        adc_channels[:, 1::2] = (
+            ((adc_data[:, 1:-1:3] & 0x0F) << 8) | adc_data[:, 2::3]
+        ) & 0xFFF
 
-    return timestamps, adc_channels
+        adc_channels[:, -1] = ((adc_data[:, -2] << 4) | (adc_data[:, -1] >> 4)) & 0xFFF
+
+        mask = headers["S"] == 0
+        return headers["Timestamp"][mask], adc_channels[mask][:, order]
+
+    def _parse_v2(
+        self, buffer: bytes, order: List[int]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        events = np.frombuffer(buffer, dtype=self.event_dtype)
+        num_events = len(events)
+
+        cnt = (events["Header0"] & 0b11000000) >> 6
+        timestamp_coarse = (
+            ((events["Header0"] & 0x3F).astype(np.uint64) << 32)
+            | (events["Timestamp_1"].astype(np.uint64) << 24)
+            | (events["Timestamp_2"].astype(np.uint64) << 16)
+            | (events["Timestamp_3"].astype(np.uint64) << 8)
+            | (events["Timestamp_4"].astype(np.uint64))
+        )
+
+        s_flags = (events["Header1"] & 0x80) >> 7
+        module_addr = events["Header1"] & 0x7F
+
+        adc_data = events["ADC_Data"].astype(np.uint16)
+        adc_channels = np.zeros((num_events, 33), dtype=np.uint16)
+
+        adc_channels[:, :-1:2] = (
+            (adc_data[:, :-2:3] << 4) | (adc_data[:, 1:-1:3] >> 4)
+        ) & 0xFFF
+
+        adc_channels[:, 1::2] = (
+            ((adc_data[:, 1:-1:3] & 0x0F) << 8) | adc_data[:, 2::3]
+        ) & 0xFFF
+
+        adc_channels[:, -1] = ((adc_data[:, -2] << 4) | (adc_data[:, -1] >> 4)) & 0xFFF
+
+        d0 = (adc_data[:, -1] & 0x08) >> 3  # bit 3 is D0
+        t_msb = adc_data[:, -1] & 0x07  # bits 0-2 are T MSB
+
+        full_timestamp = (t_msb.astype(np.uint64) << 38) | timestamp_coarse
+
+        mask = s_flags == 0
+        return full_timestamp[mask], adc_channels[mask][:, order]
 
 
 def _detect_coincidences(
@@ -211,11 +235,16 @@ def worker_process(
 
 
 def read_file_chunks(
-    file_path: str, start: int, end: int, num_ev_buf: int, event_size: int, order: list
-) -> Generator[Tuple[List[Tuple[int, int]], List[List[int]]], None, None]:
+    file_path: str,
+    start: int,
+    end: int,
+    num_ev_buf: int,
+    event_size: int,
+    order: list,
+    parser: EventParser,
+) -> Generator[Tuple[np.ndarray, np.ndarray], None, None]:
     """
-    Processes a segment of the file in smaller chunks, detects coincidences,
-    and sends results to the writer process.
+    Processes a segment of the file in smaller chunks using EventParser.
 
     Args:
         file_path (str): Path to the file.
@@ -224,6 +253,7 @@ def read_file_chunks(
         num_ev_buf (int): Size of the buffer to read.
         event_size (int): Size of each event in bytes.
         order (list): The order of the ADC channels.
+        parser (EventParser): EventParser instance to use for parsing.
     """
     buffer_size = num_ev_buf * event_size  # Define a buffer size for smaller chunks
     with open(file_path, "rb") as file:
@@ -243,15 +273,17 @@ def read_file_chunks(
                 current_position += read_size
                 pbar.update(read_size)
 
-                headers, adc_channels = _extract_data(buffer, event_size, order)
+                # Use EventParser instead of _extract_data
+                timestamps, adc_channels = parser.parse(buffer, order)
 
-                yield headers, adc_channels
+                yield timestamps, adc_channels
 
 
 if __name__ == "__main__":
     # Example usage
     # Read the file path from command-line arguments
-    file_path = "P:/Valencia/I3M/Proyectos/DeepBrain/data/05022024_FOV0_0_600s.raw"
+    # file_path = "P:/Valencia/I3M/Proyectos/DeepBrain/data/05022024_FOV0_0_600s.raw"
+    file_path = "..\\..\\..\\data\\DeepBrain\\05022024_FOV0_0_600s.raw"
     output_file = (
         "P:/Valencia/I3M/Proyectos/DeepBrain/data/05022024_FOV0_0_600s_coincidences.txt"
     )
@@ -259,28 +291,44 @@ if __name__ == "__main__":
     event_size = 56
     # order = [1, 2, 3, 4, 5, 6, 7, 8, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
     # order = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
-    order = range(33)
+    order = list(range(33))
     num_processes = 1
     threshold = 10000
     file_size = os.path.getsize(file_path)
     chunk_size = file_size // num_processes
     timestamp_list = []
     chunk_cnt = 0
+
+    # Initialize EventParser with V1 format
+    parser = EventParser(version="v1")
+
     for timestamps, adc_data_list in read_file_chunks(
-        file_path, 0, file_size, num_ev_buf, event_size, order
+        file_path, 0, file_size, num_ev_buf, event_size, order, parser
     ):
-        # print(f"First 10 timestamps: {timestamps[0]}")
-        # print(f"First 10 ADC data: {adc_data_list[0]}")
-        # input("Press Enter to continue...")
-        # for t, adc in zip(timestamps, adc_data_list):
-        #     print(t, adc)
-        #     input("Press Enter to continue...")
         if chunk_cnt <= 1:
             timestamp_list.extend(timestamps)
         chunk_cnt += 1
         pass
 
+    time_list = (
+        np.array(timestamp_list) - timestamp_list[0]
+    ) / 1e6  # Convert to seconds
+
+    fig = plt.figure(figsize=(12, 6))
     plt.plot(timestamp_list, "o-")
+    plt.xlabel("Event Index")
+    plt.ylabel("Timestamp (s)")
+    plt.title("Timestamps of Events")
+    plt.grid()
+    plt.tight_layout()
+
+    fig = plt.figure(figsize=(12, 6))
+    plt.plot(time_list, "o-")
+    plt.xlabel("Event Index")
+    plt.ylabel("Time (s)")
+    plt.title("Time of Events")
+    plt.grid()
+    plt.tight_layout()
     plt.show()
 
     """
