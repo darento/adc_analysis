@@ -1,15 +1,11 @@
-import struct
-import time
 import numpy as np
 from tqdm import tqdm
-import os
-import matplotlib.pyplot as plt
 from multiprocessing import Process, Queue
 from typing import Generator, Iterator, Tuple, List
 
 import numpy as np
 from typing import List, Tuple
-from event_formats import EVENT_DTYPE_V1, EVENT_DTYPE_V2
+from src.event_formats import EVENT_DTYPE_V1, EVENT_DTYPE_V2
 
 
 class EventParser:
@@ -65,6 +61,7 @@ class EventParser:
         adc_channels[:, -1] = ((adc_data[:, -2] << 4) | (adc_data[:, -1] >> 4)) & 0xFFF
 
         mask = headers["S"] == 0
+
         return headers["Timestamp"][mask], adc_channels[mask][:, order]
 
     def _parse_v2(
@@ -273,99 +270,12 @@ def read_file_chunks(
                 current_position += read_size
                 pbar.update(read_size)
 
-                # Use EventParser instead of _extract_data
+                # Use EventParser class to parse the buffer
+
                 timestamps, adc_channels = parser.parse(buffer, order)
 
                 yield timestamps, adc_channels
 
 
 if __name__ == "__main__":
-    # Example usage
-    # Read the file path from command-line arguments
-    # file_path = "P:/Valencia/I3M/Proyectos/DeepBrain/data/05022024_FOV0_0_600s.raw"
-    file_path = "..\\..\\..\\data\\DeepBrain\\05022024_FOV0_0_600s.raw"
-    output_file = (
-        "P:/Valencia/I3M/Proyectos/DeepBrain/data/05022024_FOV0_0_600s_coincidences.txt"
-    )
-    num_ev_buf = 10000
-    event_size = 56
-    # order = [1, 2, 3, 4, 5, 6, 7, 8, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
-    # order = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
-    order = list(range(33))
-    num_processes = 1
-    threshold = 10000
-    file_size = os.path.getsize(file_path)
-    chunk_size = file_size // num_processes
-    timestamp_list = []
-    chunk_cnt = 0
-
-    # Initialize EventParser with V1 format
-    parser = EventParser(version="v1")
-
-    for timestamps, adc_data_list in read_file_chunks(
-        file_path, 0, file_size, num_ev_buf, event_size, order, parser
-    ):
-        if chunk_cnt <= 1:
-            timestamp_list.extend(timestamps)
-        chunk_cnt += 1
-        pass
-
-    time_list = (
-        np.array(timestamp_list) - timestamp_list[0]
-    ) / 1e6  # Convert to seconds
-
-    fig = plt.figure(figsize=(12, 6))
-    plt.plot(timestamp_list, "o-")
-    plt.xlabel("Event Index")
-    plt.ylabel("Timestamp (s)")
-    plt.title("Timestamps of Events")
-    plt.grid()
-    plt.tight_layout()
-
-    fig = plt.figure(figsize=(12, 6))
-    plt.plot(time_list, "o-")
-    plt.xlabel("Event Index")
-    plt.ylabel("Time (s)")
-    plt.title("Time of Events")
-    plt.grid()
-    plt.tight_layout()
-    plt.show()
-
-    """
-
-    # Create a Queue for communication
-    queue = Queue(maxsize=100000)
-
-    # Start writer process
-    writer = Process(target=writer_process, args=(output_file, queue))
-    writer.start()
-
-    # Start worker processes
-    processes = []
-    for i in range(num_processes):
-        start = i * chunk_size
-        end = (i + 1) * chunk_size if i < num_processes - 1 else file_size
-        process = Process(
-            target=worker_process,
-            args=(
-                file_path,
-                start,
-                end,
-                num_ev_buf,
-                event_size,
-                order,
-                threshold,
-                queue,
-            ),
-        )
-        processes.append(process)
-        process.start()
-
-    # Wait for workers to finish
-    for process in processes:
-        process.join()
-
-    # Signal the writer to stop
-    queue.put("DONE")
-    writer.join()
-    """
+    pass
